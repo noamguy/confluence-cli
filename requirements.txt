@@ -1,0 +1,8 @@
+anthropic>=0.40.0
+requests>=2.32.0
+python-dotenv>=1.0.1
+rich>=13.7.0
+mcp>=1.2.0
+pytest>=8.3.0
+pytest-mock>=3.14.0
+responses>=0.25.0
