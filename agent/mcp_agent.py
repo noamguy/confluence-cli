@@ -1,39 +1,64 @@
-"""MCP-mode agent: Claude + official Atlassian MCP server.
+"""MCP-mode agent: Claude + official Atlassian MCP server via mcp-remote.
 
-This mode delegates tool discovery and execution to the hosted Atlassian
-MCP server at ``https://mcp.atlassian.com``. Instead of defining tools
-ourselves, we:
+Why mcp-remote instead of direct HTTP:
+    The hosted Atlassian MCP server at ``https://mcp.atlassian.com/v1/mcp``
+    does **not** accept standard Atlassian OAuth 2.0 bearer tokens passed
+    as an ``Authorization`` header. Attempts to connect directly with a
+    token produced by our :mod:`agent.oauth` flow fail with opaque
+    "invalid_token" / "trouble completing this action" errors because
+    the server expects its own separate browser-based auth handshake.
 
-    1. Connect to the MCP server over streamable HTTP, authenticating with
-       the same Atlassian OAuth token used by the REST agent.
-    2. Ask the server for its tool list and convert those MCP tool
-       definitions into Anthropic tool schemas.
-    3. Run the standard Claude tool-use loop, dispatching every tool call
-       back through the MCP ``call_tool`` RPC.
+    Atlassian's supported path is to use `mcp-remote`_ — an ``npx``
+    Node.js package that runs locally as an ``stdio`` MCP proxy, opens
+    its own browser window on first run, caches credentials under
+    ``~/.mcp-auth/``, and forwards JSON-RPC between our Python process
+    and Atlassian's hosted server.
 
-Compared with the REST agent this implementation is shorter *in our own
-code*, but every request pays the cost of Atlassian injecting its full
-schema (~24k tokens) and every tool call is subject to the hosted server's
-reliability. See the README comparison table for the trade-offs.
+    Consequences:
+        * Node.js (v18+) is now a runtime prerequisite for ``--mode mcp``.
+        * MCP mode and REST mode **cannot share** an OAuth token: the
+          REST path uses our :mod:`agent.oauth` token, and the MCP path
+          uses whatever mcp-remote caches out-of-band.
+        * The auth lifecycle for MCP mode is entirely opaque to us —
+          we cannot refresh, inspect, or reset it from Python.
+          ``--reset`` in our CLI only affects the REST token.
+
+    See ANALYSIS.md for the full write-up of this limitation.
+
+.. _mcp-remote: https://www.npmjs.com/package/mcp-remote
+
+The rest of this module (streaming tool-use loop, retry logic, token
+usage accounting) is identical to :class:`RestAgent` — only the
+transport layer changed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from typing import Any, Callable, Optional
 
 import anthropic
 
-from .oauth import OAuthClient, TokenBundle
 from .rest_agent import (
+    ANTHROPIC_MAX_ATTEMPTS,
     AgentResponse,
+    _compute_anthropic_backoff,
     _format_tool_call,
+    _is_retryable_anthropic_error,
     _stringify_tool_result,
 )
 
-#: Atlassian hosted MCP endpoint (streamable HTTP transport).
+#: Atlassian hosted MCP endpoint. Passed as an argument to ``mcp-remote``,
+#: which connects to it over streamable HTTP on our behalf.
 ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
+
+#: The stdio proxy command that mediates between our MCP ``ClientSession``
+#: and the hosted Atlassian server. ``npx -y`` auto-installs ``mcp-remote``
+#: on first use and keeps it cached across runs.
+MCP_REMOTE_COMMAND = "npx"
+MCP_REMOTE_ARGS = ["-y", "mcp-remote", ATLASSIAN_MCP_URL]
 
 #: Max attempts (including the first try) for a single MCP tool call
 #: when the server returns a transient error.
@@ -88,6 +113,7 @@ def _format_exception(exc: BaseException, depth: int = 0) -> str:
         return header + "\n" + _format_exception(chained, depth + 1)
     return header
 
+
 #: Same model as the REST agent, per project spec.
 MODEL = "claude-sonnet-4-6"
 
@@ -104,18 +130,19 @@ SYSTEM_PROMPT = (
 class McpAgent:
     """Agent that answers questions via the official Atlassian MCP server.
 
-    The MCP session is opened lazily on the first :meth:`ask` call and
-    reused across subsequent calls in the same REPL loop. Token refresh is
-    handled by :class:`OAuthClient`; if the access token expires we rebuild
-    the MCP session transparently.
+    Transport:
+        Uses ``mcp-remote`` (a Node.js package) as a local ``stdio``
+        subprocess. mcp-remote is responsible for its own browser-based
+        Atlassian auth on first run; credentials are cached under
+        ``~/.mcp-auth/`` outside of our control. This class does *not*
+        take an ``OAuthClient`` — MCP mode and REST mode each run their
+        own independent auth flow.
     """
 
     def __init__(
         self,
         anthropic_api_key: str,
-        oauth_client: OAuthClient,
         space_key: str,
-        token_bundle: Optional[TokenBundle] = None,
         model: str = MODEL,
         mcp_url: str = ATLASSIAN_MCP_URL,
     ) -> None:
@@ -123,18 +150,16 @@ class McpAgent:
 
         Args:
             anthropic_api_key: API key for Claude.
-            oauth_client:      Configured Atlassian OAuth client.
             space_key:         Confluence space key (passed to the model as context).
-            token_bundle:      Optional pre-fetched token bundle (mainly for tests).
             model:             Claude model id.
-            mcp_url:           Override of the Atlassian MCP endpoint.
+            mcp_url:           Override of the Atlassian MCP endpoint. When
+                               overridden, the new URL is passed through
+                               to ``mcp-remote`` as its last argument.
         """
         self.anthropic = anthropic.Anthropic(api_key=anthropic_api_key)
-        self.oauth_client = oauth_client
         self.space_key = space_key
         self.model = model
         self.mcp_url = mcp_url
-        self._token = token_bundle or oauth_client.get_valid_token()
         # Cache of MCP tool definitions in Anthropic format.
         self._tool_schemas: Optional[list[dict[str, Any]]] = None
 
@@ -142,20 +167,31 @@ class McpAgent:
     # MCP plumbing
     # ------------------------------------------------------------------
 
-    async def _list_mcp_tools(self) -> list[dict[str, Any]]:
-        """Connect to the MCP server and convert its tool list to Anthropic format.
+    def _stdio_params(self):
+        """Build the StdioServerParameters used to spawn ``mcp-remote``.
 
-        We keep the connection short-lived on purpose: every request opens,
-        lists tools (or calls one), and closes. This mirrors what the
-        hosted server expects and avoids holding an idle SSE connection —
-        which is exactly the class of failure the ``invalid_token``
-        degradation in the README comparison table refers to.
+        Returns a fresh object on every call because the ``mcp`` SDK
+        treats it as per-invocation state.
+        """
+        from mcp import StdioServerParameters
+
+        # Build the args list per-call so mcp_url overrides work.
+        args = ["-y", "mcp-remote", self.mcp_url]
+        return StdioServerParameters(command=MCP_REMOTE_COMMAND, args=args)
+
+    async def _list_mcp_tools(self) -> list[dict[str, Any]]:
+        """Spawn mcp-remote, ask it for the Atlassian tool list, and exit.
+
+        We keep the subprocess short-lived on purpose: every request
+        spawns a fresh mcp-remote, lists tools (or calls one), and tears
+        the subprocess down. This mirrors how most MCP clients integrate
+        with mcp-remote and avoids holding a long-lived Node.js process
+        whose connection can silently rot.
         """
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
+        from mcp.client.stdio import stdio_client
 
-        headers = {"Authorization": f"Bearer {self._token.access_token}"}
-        async with streamablehttp_client(self.mcp_url, headers=headers) as (read, write, _):
+        async with stdio_client(self._stdio_params()) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 listed = await session.list_tools()
@@ -163,6 +199,9 @@ class McpAgent:
 
     async def _call_mcp_tool(self, name: str, arguments: dict) -> Any:
         """Invoke a single MCP tool and return its content payload.
+
+        Spawns a fresh ``mcp-remote`` subprocess per call (same rationale
+        as :meth:`_list_mcp_tools`).
 
         Implements a small retry loop for server-reported *transient*
         errors — the Atlassian MCP server periodically returns
@@ -178,18 +217,13 @@ class McpAgent:
                 immediately when the error is not recognised as transient.
         """
         from mcp import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
+        from mcp.client.stdio import stdio_client
 
         last_error: Optional[RuntimeError] = None
 
         for attempt in range(MCP_MAX_ATTEMPTS):
             try:
-                headers = {"Authorization": f"Bearer {self._token.access_token}"}
-                async with streamablehttp_client(self.mcp_url, headers=headers) as (
-                    read,
-                    write,
-                    _,
-                ):
+                async with stdio_client(self._stdio_params()) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
                         result = await session.call_tool(name, arguments)
@@ -237,13 +271,6 @@ class McpAgent:
             self._tool_schemas = asyncio.run(self._list_mcp_tools())
         return self._tool_schemas
 
-    def _ensure_fresh_token(self) -> None:
-        """Refresh the OAuth token if it has expired, invalidating the tool cache."""
-        if self._token.is_expired():
-            self._token = self.oauth_client.get_valid_token()
-            # Tool list shouldn't change, but re-fetch to pick up any server-side changes.
-            self._tool_schemas = None
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -262,7 +289,6 @@ class McpAgent:
         every tool call is dispatched to the MCP server instead of our
         local REST client.
         """
-        self._ensure_fresh_token()
         tool_schemas = self._ensure_tool_schemas()
 
         messages: list[dict[str, Any]] = [
@@ -282,18 +308,52 @@ class McpAgent:
             if on_turn_start is not None:
                 on_turn_start()
 
-            with self.anthropic.messages.stream(
-                model=self.model,
-                max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                tools=tool_schemas,
-                messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    streamed_answer.append(text)
-                    if on_text is not None:
-                        on_text(text)
-                final_message = stream.get_final_message()
+            # Retry loop for transient Anthropic API errors (overloaded,
+            # rate-limited, 5xx). Only retries when no text has streamed
+            # yet — see RestAgent.ask for the reasoning.
+            final_message = None
+            for attempt in range(ANTHROPIC_MAX_ATTEMPTS):
+                attempt_streamed_any = False
+                try:
+                    with self.anthropic.messages.stream(
+                        model=self.model,
+                        max_tokens=2048,
+                        system=SYSTEM_PROMPT,
+                        tools=tool_schemas,
+                        messages=messages,
+                    ) as stream:
+                        for text in stream.text_stream:
+                            attempt_streamed_any = True
+                            streamed_answer.append(text)
+                            if on_text is not None:
+                                on_text(text)
+                        final_message = stream.get_final_message()
+                    break  # success — exit retry loop
+                except Exception as exc:  # noqa: BLE001
+                    is_last = attempt == ANTHROPIC_MAX_ATTEMPTS - 1
+                    if (
+                        attempt_streamed_any
+                        or is_last
+                        or not _is_retryable_anthropic_error(exc)
+                    ):
+                        raise
+                    delay = _compute_anthropic_backoff(exc, attempt)
+                    if delay is None:
+                        # Server asked us to wait longer than we'll block
+                        # the REPL for (typically a TPM budget exhaustion
+                        # — exactly the failure mode MCP mode provokes
+                        # because of its 24k-token-per-query schema cost).
+                        raise
+                    print(
+                        f"  \u21bb Anthropic API returned a transient error "
+                        f"({type(exc).__name__}); retrying in {delay:.0f}s "
+                        f"(attempt {attempt + 2}/{ANTHROPIC_MAX_ATTEMPTS})…",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(delay)
+
+            assert final_message is not None
 
             input_total += getattr(final_message.usage, "input_tokens", 0) or 0
             output_total += getattr(final_message.usage, "output_tokens", 0) or 0

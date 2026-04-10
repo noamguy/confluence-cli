@@ -14,6 +14,8 @@ Compared with the MCP-backed agent, this mode:
 
 from __future__ import annotations
 
+import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -27,6 +29,121 @@ MODEL = "claude-sonnet-4-6"
 
 #: Max tool-use / model iterations per user question. Prevents runaway loops.
 MAX_ITERATIONS = 8
+
+#: Max attempts (including the first try) for a single Anthropic Messages
+#: call when the API returns a transient error (overloaded, rate-limited,
+#: 5xx, timeout).
+ANTHROPIC_MAX_ATTEMPTS = 3
+
+#: Seconds to wait before the first Anthropic retry; subsequent retries
+#: use exponential backoff (2s, 4s, …).
+ANTHROPIC_RETRY_BASE_DELAY = 2.0
+
+#: HTTP status codes from the Anthropic API that we treat as transient
+#: and worth retrying. 529 is Anthropic's "overloaded_error" code.
+_RETRYABLE_ANTHROPIC_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+
+#: Maximum ``Retry-After`` delay we're willing to honor in an interactive
+#: REPL. Longer than this and we fail fast so the user can decide what
+#: to do, rather than blocking the CLI for a minute. Most rate-limit
+#: responses give a few seconds; the "10k input tokens per minute" bucket
+#: is the one scenario where Anthropic may return a much longer value,
+#: and that case is unrecoverable in a single interactive question
+#: regardless of backoff.
+_MAX_RETRY_AFTER_SECONDS = 10.0
+
+#: Fallback delay on a 429 response when no ``Retry-After`` header is set.
+_DEFAULT_RATE_LIMIT_DELAY = 5.0
+
+#: Substring markers in the error text/body that indicate a transient
+#: Anthropic failure, used as a fallback when the exception doesn't
+#: carry a structured status code.
+_RETRYABLE_ANTHROPIC_MARKERS = (
+    "overloaded",
+    "rate_limit",
+    "rate limit",
+    "timeout",
+    "temporarily unavailable",
+)
+
+
+def _is_retryable_anthropic_error(exc: BaseException) -> bool:
+    """Return True if an Anthropic API exception looks transient.
+
+    We first check for an explicit HTTP ``status_code`` attribute (the
+    ``anthropic.APIStatusError`` hierarchy exposes one) against
+    :data:`_RETRYABLE_ANTHROPIC_STATUSES`. If that's absent or
+    inconclusive, we fall back to substring matching on ``str(exc)`` for
+    the words Anthropic actually uses in their error payloads
+    (``overloaded``, ``rate_limit``, etc).
+
+    This is intentionally narrow: authentication failures, bad requests,
+    and context-length errors are NOT retried — retrying those would
+    just burn time on a request that will never succeed.
+    """
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code in _RETRYABLE_ANTHROPIC_STATUSES:
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _RETRYABLE_ANTHROPIC_MARKERS)
+
+
+def _extract_retry_after(exc: BaseException) -> Optional[float]:
+    """Return the ``Retry-After`` header value in seconds, if present.
+
+    The anthropic SDK's ``RateLimitError`` exposes the underlying HTTP
+    response via ``exc.response``; we walk through it defensively because
+    older SDK versions may attach headers differently. Returns ``None``
+    if the header is missing, non-numeric, or unreachable.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    # httpx Headers is case-insensitive but we defensively try both.
+    raw = None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    except (AttributeError, TypeError):
+        return None
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_anthropic_backoff(
+    exc: BaseException, attempt: int
+) -> Optional[float]:
+    """Return the seconds to sleep before the next Anthropic retry, or None.
+
+    Returns ``None`` to signal "do not retry this one — fail fast". This
+    happens when the server-reported ``Retry-After`` exceeds
+    :data:`_MAX_RETRY_AFTER_SECONDS`, which is Anthropic's way of telling
+    us the token bucket won't refill in an interactive window.
+
+    For rate-limit errors, prefer the server's ``Retry-After`` (capped at
+    :data:`_MAX_RETRY_AFTER_SECONDS`); fall back to a small fixed delay
+    when the header is absent. For other transient errors (overloaded,
+    5xx) use exponential backoff from :data:`ANTHROPIC_RETRY_BASE_DELAY`.
+    """
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        retry_after = _extract_retry_after(exc)
+        if retry_after is None:
+            return _DEFAULT_RATE_LIMIT_DELAY
+        if retry_after > _MAX_RETRY_AFTER_SECONDS:
+            # Server says "wait longer than we're willing to block the
+            # REPL for". Fail fast so main.py can render a context-aware
+            # error and let the user decide.
+            return None
+        return retry_after
+    # Non-rate-limit transient errors use plain exponential backoff.
+    return ANTHROPIC_RETRY_BASE_DELAY * (2 ** attempt)
 
 #: System prompt given to Claude. Kept short to keep input tokens low.
 SYSTEM_PROMPT = (
@@ -166,18 +283,55 @@ class RestAgent:
             if on_turn_start is not None:
                 on_turn_start()
 
-            with self.anthropic.messages.stream(
-                model=self.model,
-                max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                tools=TOOL_SCHEMAS,
-                messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    streamed_answer.append(text)
-                    if on_text is not None:
-                        on_text(text)
-                final_message = stream.get_final_message()
+            # Retry loop for transient Anthropic API errors (overloaded,
+            # rate-limited, 5xx). We only retry if NO text has streamed
+            # yet — retrying mid-stream would show the user a garbled
+            # answer followed by a second, different answer.
+            final_message = None
+            for attempt in range(ANTHROPIC_MAX_ATTEMPTS):
+                attempt_streamed_any = False
+                try:
+                    with self.anthropic.messages.stream(
+                        model=self.model,
+                        max_tokens=2048,
+                        system=SYSTEM_PROMPT,
+                        tools=TOOL_SCHEMAS,
+                        messages=messages,
+                    ) as stream:
+                        for text in stream.text_stream:
+                            attempt_streamed_any = True
+                            streamed_answer.append(text)
+                            if on_text is not None:
+                                on_text(text)
+                        final_message = stream.get_final_message()
+                    break  # success — exit retry loop
+                except Exception as exc:  # noqa: BLE001
+                    is_last = attempt == ANTHROPIC_MAX_ATTEMPTS - 1
+                    if (
+                        attempt_streamed_any
+                        or is_last
+                        or not _is_retryable_anthropic_error(exc)
+                    ):
+                        raise
+                    delay = _compute_anthropic_backoff(exc, attempt)
+                    if delay is None:
+                        # Server-reported Retry-After exceeds our cap —
+                        # typically a TPM rate-limit that won't refill in
+                        # an interactive window. Fail fast so main.py can
+                        # render a friendly, mode-aware error.
+                        raise
+                    print(
+                        f"  \u21bb Anthropic API returned a transient error "
+                        f"({type(exc).__name__}); retrying in {delay:.0f}s "
+                        f"(attempt {attempt + 2}/{ANTHROPIC_MAX_ATTEMPTS})…",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(delay)
+
+            # Defensive: every code path above either assigned
+            # final_message or re-raised.
+            assert final_message is not None
 
             input_total += getattr(final_message.usage, "input_tokens", 0) or 0
             output_total += getattr(final_message.usage, "output_tokens", 0) or 0

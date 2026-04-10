@@ -149,17 +149,40 @@ class ConfluenceRestClient:
         self.space_key = space_key
         self.site_url = (site_url or "").rstrip("/")
         # OAuth-based Confluence REST calls are routed through api.atlassian.com
-        # and addressed by cloud id.
+        # and addressed by cloud id. Confluence exposes two parallel REST
+        # surfaces we care about:
+        #
+        #   * v1 — ``/wiki/rest/api`` — still has the cleanest CQL search,
+        #     kept here for :meth:`search` and :meth:`list_pages_in_space`.
+        #   * v2 — ``/wiki/api/v2`` — the non-deprecated content surface.
+        #     We use it for :meth:`get_page` because the v1 ``/content/{id}``
+        #     endpoint now returns HTTP 410 Gone for some content as
+        #     Atlassian phases it out.
         self.api_base = f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/rest/api"
+        self.api_base_v2 = f"https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2"
 
     # ------------------------------------------------------------------
     # Internal HTTP helper
     # ------------------------------------------------------------------
 
-    def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        """GET an API path and return the decoded JSON body."""
+    def _get(
+        self,
+        path: str,
+        params: Optional[dict] = None,
+        *,
+        v2: bool = False,
+    ) -> dict:
+        """GET an API path and return the decoded JSON body.
+
+        Args:
+            path:   Path below the selected API base (leading slash).
+            params: Optional query-string parameters.
+            v2:     If True, route through :attr:`api_base_v2` (Confluence
+                    REST v2) instead of the v1 base.
+        """
+        base = self.api_base_v2 if v2 else self.api_base
         resp = requests.get(
-            f"{self.api_base}{path}",
+            f"{base}{path}",
             headers={
                 "Authorization": f"Bearer {self.access_token}",
                 "Accept": "application/json",
@@ -206,10 +229,16 @@ class ConfluenceRestClient:
         return results
 
     def get_page(self, page_id: str) -> dict:
-        """Fetch a single page by id with its body expanded to storage format."""
+        """Fetch a single page by id via the Confluence REST **v2** API.
+
+        Uses ``GET /wiki/api/v2/pages/{id}?body-format=storage``. The v1
+        ``/content/{id}`` endpoint has been deprecated and returns HTTP
+        410 Gone for some content, so we only use v2 for reads.
+        """
         payload = self._get(
-            f"/content/{page_id}",
-            params={"expand": "body.storage,version,space"},
+            f"/pages/{page_id}",
+            params={"body-format": "storage"},
+            v2=True,
         )
         body_storage = (
             payload.get("body", {}).get("storage", {}).get("value", "")

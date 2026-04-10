@@ -20,7 +20,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.oauth import TokenBundle
-from agent.rest_agent import RestAgent, _format_tool_call
+from agent.rest_agent import (
+    _DEFAULT_RATE_LIMIT_DELAY,
+    _MAX_RETRY_AFTER_SECONDS,
+    RestAgent,
+    _compute_anthropic_backoff,
+    _extract_retry_after,
+    _format_tool_call,
+    _is_retryable_anthropic_error,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +121,196 @@ def test_format_tool_call_single_query_uses_shortcut() -> None:
 
 def test_format_tool_call_multi_arg_uses_kwargs() -> None:
     assert _format_tool_call("get_page", {"id": 589825}) == "get_page(id=589825)"
+
+
+# ---------------------------------------------------------------------------
+# _is_retryable_anthropic_error
+# ---------------------------------------------------------------------------
+
+
+def test_is_retryable_overloaded_by_message() -> None:
+    exc = RuntimeError(
+        "{'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}}"
+    )
+    assert _is_retryable_anthropic_error(exc) is True
+
+
+def test_is_retryable_by_status_code() -> None:
+    class FakeStatusError(Exception):
+        status_code = 529
+
+    assert _is_retryable_anthropic_error(FakeStatusError("Overloaded")) is True
+
+
+def test_is_retryable_rejects_auth_errors() -> None:
+    class FakeStatusError(Exception):
+        status_code = 401
+
+    assert _is_retryable_anthropic_error(FakeStatusError("invalid api key")) is False
+
+
+def test_is_retryable_rejects_bad_requests() -> None:
+    class FakeStatusError(Exception):
+        status_code = 400
+
+    assert _is_retryable_anthropic_error(FakeStatusError("context too long")) is False
+
+
+# ---------------------------------------------------------------------------
+# Retry-After extraction and rate-limit backoff
+# ---------------------------------------------------------------------------
+
+
+class _FakeHeaders:
+    """Case-insensitive header stub with a dict-like ``get`` method."""
+
+    def __init__(self, mapping: dict) -> None:
+        self._mapping = {k.lower(): v for k, v in mapping.items()}
+
+    def get(self, key, default=None):
+        return self._mapping.get(key.lower(), default)
+
+
+class _FakeResponse:
+    def __init__(self, headers: dict) -> None:
+        self.headers = _FakeHeaders(headers)
+
+
+class _FakeRateLimit(Exception):
+    status_code = 429
+
+    def __init__(self, headers: dict) -> None:
+        super().__init__("rate_limit_error")
+        self.response = _FakeResponse(headers)
+
+
+def test_extract_retry_after_parses_numeric_header() -> None:
+    exc = _FakeRateLimit({"Retry-After": "7"})
+    assert _extract_retry_after(exc) == 7.0
+
+
+def test_extract_retry_after_handles_lowercase_header() -> None:
+    exc = _FakeRateLimit({"retry-after": "3.5"})
+    assert _extract_retry_after(exc) == 3.5
+
+
+def test_extract_retry_after_returns_none_when_missing() -> None:
+    exc = _FakeRateLimit({})
+    assert _extract_retry_after(exc) is None
+
+
+def test_extract_retry_after_returns_none_on_non_numeric() -> None:
+    exc = _FakeRateLimit({"Retry-After": "Wed, 21 Oct 2025 07:28:00 GMT"})
+    assert _extract_retry_after(exc) is None
+
+
+def test_extract_retry_after_returns_none_when_no_response() -> None:
+    exc = _FakeRateLimit({})
+    del exc.response  # simulate a differently-shaped SDK error
+    assert _extract_retry_after(exc) is None
+
+
+def test_compute_backoff_uses_retry_after_when_short() -> None:
+    exc = _FakeRateLimit({"Retry-After": "4"})
+    assert _compute_anthropic_backoff(exc, attempt=0) == 4.0
+
+
+def test_compute_backoff_returns_none_when_retry_after_exceeds_cap() -> None:
+    """Long Retry-After → signal fail-fast with None."""
+    exc = _FakeRateLimit({"Retry-After": str(_MAX_RETRY_AFTER_SECONDS + 30)})
+    assert _compute_anthropic_backoff(exc, attempt=0) is None
+
+
+def test_compute_backoff_falls_back_to_default_on_429_without_header() -> None:
+    exc = _FakeRateLimit({})
+    assert _compute_anthropic_backoff(exc, attempt=0) == _DEFAULT_RATE_LIMIT_DELAY
+
+
+def test_compute_backoff_uses_exponential_for_non_rate_limit() -> None:
+    """Non-429 errors get plain exponential backoff — no retry-after check."""
+
+    class Overloaded(Exception):
+        status_code = 529
+
+    exc = Overloaded("Overloaded")
+    # attempt=0 → base * 2^0 = 2.0, attempt=1 → 4.0
+    assert _compute_anthropic_backoff(exc, attempt=0) == 2.0
+    assert _compute_anthropic_backoff(exc, attempt=1) == 4.0
+
+
+def test_ask_fails_fast_on_tpm_rate_limit_with_long_retry_after() -> None:
+    """A 429 with Retry-After > cap should NOT retry — raise on attempt 1."""
+    oauth_client = MagicMock()
+
+    class TPMRateLimit(Exception):
+        status_code = 429
+
+        def __init__(self) -> None:
+            super().__init__(
+                "rate_limit_error: 10,000 input tokens per minute"
+            )
+            self.response = _FakeResponse(
+                {"Retry-After": str(_MAX_RETRY_AFTER_SECONDS + 30)}
+            )
+
+    fake_anthropic = MagicMock()
+    fake_anthropic.messages.stream.side_effect = TPMRateLimit()
+
+    with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
+        "agent.rest_agent.time.sleep"
+    ) as sleep_mock:
+        agent = RestAgent(
+            anthropic_api_key="k",
+            oauth_client=oauth_client,
+            space_key="PH",
+            token_bundle=_valid_token(),
+        )
+        with pytest.raises(TPMRateLimit):
+            agent.ask("hi")
+
+    # Failed on the first attempt, no retries, no sleep.
+    assert fake_anthropic.messages.stream.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_ask_retries_short_rate_limit_with_server_delay() -> None:
+    """A 429 with Retry-After <= cap should retry after honouring it."""
+    oauth_client = MagicMock()
+
+    class ShortRateLimit(Exception):
+        status_code = 429
+
+        def __init__(self) -> None:
+            super().__init__("rate_limit_error")
+            self.response = _FakeResponse({"Retry-After": "3"})
+
+    final = _message([_text_block("ok")], stop_reason="end_turn")
+    call_count = {"n": 0}
+
+    def _stream(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ShortRateLimit()
+        return _FakeStream(final, ["ok"])
+
+    fake_anthropic = MagicMock()
+    fake_anthropic.messages.stream.side_effect = _stream
+
+    with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
+        "agent.rest_agent.time.sleep"
+    ) as sleep_mock:
+        agent = RestAgent(
+            anthropic_api_key="k",
+            oauth_client=oauth_client,
+            space_key="PH",
+            token_bundle=_valid_token(),
+        )
+        response = agent.ask("hi")
+
+    assert response.answer == "ok"
+    assert call_count["n"] == 2
+    # The single backoff sleep must have honoured the server's 3-second hint.
+    sleep_mock.assert_called_once_with(3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +476,100 @@ def test_ask_surfaces_tool_errors_to_claude() -> None:
     assert tool_result_msg["content"][0]["is_error"] is True
     assert "http 500" in tool_result_msg["content"][0]["content"]
     assert response.answer == "I saw the error."
+
+
+def test_ask_retries_on_anthropic_overloaded_error() -> None:
+    """A 529/overloaded on the first stream call should retry transparently."""
+    oauth_client = MagicMock()
+
+    class OverloadedError(Exception):
+        status_code = 529
+
+    final = _message([_text_block("ok")], stop_reason="end_turn")
+
+    call_count = {"n": 0}
+
+    def _stream(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OverloadedError(
+                "{'type': 'error', 'error': {'type': 'overloaded_error', "
+                "'message': 'Overloaded'}}"
+            )
+        return _FakeStream(final, ["ok"])
+
+    fake_anthropic = MagicMock()
+    fake_anthropic.messages.stream.side_effect = _stream
+
+    with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
+        "agent.rest_agent.time.sleep"
+    ) as sleep_mock:
+        agent = RestAgent(
+            anthropic_api_key="k",
+            oauth_client=oauth_client,
+            space_key="PH",
+            token_bundle=_valid_token(),
+        )
+        response = agent.ask("hi")
+
+    assert response.answer == "ok"
+    assert call_count["n"] == 2  # initial failure + successful retry
+    sleep_mock.assert_called_once()  # exactly one backoff sleep between the two tries
+
+
+def test_ask_gives_up_after_max_attempts_on_overloaded() -> None:
+    """If every retry also fails, the exception is re-raised."""
+    oauth_client = MagicMock()
+
+    class OverloadedError(Exception):
+        status_code = 529
+
+    def _stream(**kwargs):
+        raise OverloadedError("Overloaded")
+
+    fake_anthropic = MagicMock()
+    fake_anthropic.messages.stream.side_effect = _stream
+
+    with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
+        "agent.rest_agent.time.sleep"
+    ):
+        agent = RestAgent(
+            anthropic_api_key="k",
+            oauth_client=oauth_client,
+            space_key="PH",
+            token_bundle=_valid_token(),
+        )
+        with pytest.raises(OverloadedError):
+            agent.ask("hi")
+
+    # 3 attempts total (ANTHROPIC_MAX_ATTEMPTS)
+    assert fake_anthropic.messages.stream.call_count == 3
+
+
+def test_ask_does_not_retry_auth_errors() -> None:
+    """A 401 should bubble up immediately without retrying."""
+    oauth_client = MagicMock()
+
+    class AuthError(Exception):
+        status_code = 401
+
+    fake_anthropic = MagicMock()
+    fake_anthropic.messages.stream.side_effect = AuthError("bad key")
+
+    with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
+        "agent.rest_agent.time.sleep"
+    ) as sleep_mock:
+        agent = RestAgent(
+            anthropic_api_key="k",
+            oauth_client=oauth_client,
+            space_key="PH",
+            token_bundle=_valid_token(),
+        )
+        with pytest.raises(AuthError):
+            agent.ask("hi")
+
+    assert fake_anthropic.messages.stream.call_count == 1  # no retry
+    sleep_mock.assert_not_called()
 
 
 def test_ask_refreshes_token_when_expired() -> None:

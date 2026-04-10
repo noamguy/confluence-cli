@@ -42,13 +42,34 @@ TOKEN_URL = "https://auth.atlassian.com/oauth/token"
 #: We use this to resolve the numeric `cloudid` required by the Confluence REST v2 API.
 ACCESSIBLE_RESOURCES_URL = "https://api.atlassian.com/oauth/token/accessible-resources"
 
-#: Scopes needed for reading and searching Confluence content, plus the offline
-#: scope so Atlassian issues a refresh token.
+#: OAuth scopes requested during the browser flow.
+#:
+#: This list mirrors the exact consent screen shown by the Atlassian MCP
+#: server integration on claude.ai — i.e. the scope set that
+#: ``mcp.atlassian.com`` itself expects. Matching it exactly is what
+#: lets ``--mode mcp`` work: the MCP server's tools (``atlassianUserInfo``
+#: needs ``read:me``; the page/comment tools need the granular
+#: ``*:page:confluence`` / ``*:comment:confluence`` scopes) will fail
+#: with ``isError=true`` if any of these are missing.
+#:
+#: ``offline_access`` isn't shown on the consent screen but is required
+#: so Atlassian issues a refresh token.
 DEFAULT_SCOPES = [
-    "read:confluence-content.all",
-    "read:confluence-content.summary",
-    "read:confluence-space.summary",
+    # --- Confluence: View ---
+    "read:page:confluence",
+    "read:content-details:confluence",
+    "read:space-details:confluence",
+    "read:comment:confluence",
+    "read:confluence-user",
+    # --- Confluence: Update ---
+    "write:page:confluence",
+    "write:comment:confluence",
+    # --- Confluence: Search ---
     "search:confluence",
+    # --- User: View ---
+    "read:me",
+    "read:account",
+    # --- Refresh-token issuance ---
     "offline_access",
 ]
 
@@ -170,19 +191,57 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
+class _ReusableTCPServer(socketserver.TCPServer):
+    """A ``TCPServer`` with ``SO_REUSEADDR`` enabled.
+
+    The OAuth flow opens a short-lived loopback server on
+    :data:`LOOPBACK_PORT`. Without ``SO_REUSEADDR``, running the flow
+    twice in quick succession (e.g. ``--reset`` immediately after a
+    previous run) fails with ``OSError: [Errno 48] Address already in
+    use`` because the kernel keeps the previous socket in ``TIME_WAIT``
+    for ~60 seconds. Enabling address reuse lets us bind over a stale
+    socket from the same user on the same host, which is safe for a
+    loopback-only server.
+    """
+
+    allow_reuse_address = True
+
+
 def _run_loopback_server() -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Block until a single OAuth callback request is received.
 
     Returns:
         A ``(code, state, error)`` tuple. At most one of ``code`` or
         ``error`` will be populated on a correctly behaving auth server.
+
+    Raises:
+        RuntimeError: if the loopback port is actually in use by another
+            process (as opposed to a stale ``TIME_WAIT`` socket, which
+            ``_ReusableTCPServer`` silently handles).
     """
-    with socketserver.TCPServer(("127.0.0.1", LOOPBACK_PORT), _CallbackHandler) as httpd:
-        httpd.auth_code = None  # type: ignore[attr-defined]
-        httpd.auth_state = None  # type: ignore[attr-defined]
-        httpd.auth_error = None  # type: ignore[attr-defined]
-        httpd.handle_request()  # exactly one request, then exit
-        return httpd.auth_code, httpd.auth_state, httpd.auth_error  # type: ignore[attr-defined]
+    try:
+        with _ReusableTCPServer(
+            ("127.0.0.1", LOOPBACK_PORT), _CallbackHandler
+        ) as httpd:
+            httpd.auth_code = None  # type: ignore[attr-defined]
+            httpd.auth_state = None  # type: ignore[attr-defined]
+            httpd.auth_error = None  # type: ignore[attr-defined]
+            httpd.handle_request()  # exactly one request, then exit
+            return (
+                httpd.auth_code,  # type: ignore[attr-defined]
+                httpd.auth_state,  # type: ignore[attr-defined]
+                httpd.auth_error,  # type: ignore[attr-defined]
+            )
+    except OSError as exc:
+        if exc.errno == 48 or "Address already in use" in str(exc):
+            raise RuntimeError(
+                f"cannot bind OAuth callback server on port {LOOPBACK_PORT}: "
+                f"another process is already listening on it. Identify it "
+                f"with:\n    lsof -i :{LOOPBACK_PORT}\n"
+                f"…then either stop that process or free the port before "
+                f"retrying."
+            ) from exc
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +352,18 @@ class OAuthClient:
         captured: dict = {}
 
         def _serve():
-            code, got_state, error = _run_loopback_server()
-            captured["code"] = code
-            captured["state"] = got_state
-            captured["error"] = error
+            # Capture any exception raised by the server so the main
+            # thread can re-raise it with proper context. Without this,
+            # a socket-bind failure dies silently in the background
+            # thread and the main thread falls through to the useless
+            # "Timed out waiting for OAuth callback" message.
+            try:
+                code, got_state, error = _run_loopback_server()
+                captured["code"] = code
+                captured["state"] = got_state
+                captured["error"] = error
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                captured["thread_exc"] = exc
 
         server_thread = threading.Thread(target=_serve, daemon=True)
         server_thread.start()
@@ -304,6 +371,11 @@ class OAuthClient:
         webbrowser.open(auth_url)
         server_thread.join(timeout=300)
 
+        # Surface background-thread failures *before* checking for the
+        # callback code, otherwise the user sees "timed out" when the
+        # real issue was something like a port collision.
+        if "thread_exc" in captured:
+            raise captured["thread_exc"]
         if captured.get("error"):
             raise RuntimeError(f"OAuth error: {captured['error']}")
         if not captured.get("code"):

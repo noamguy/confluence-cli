@@ -91,13 +91,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def print_banner(mode: str, space_key: str, site_url: str) -> None:
     """Print a styled welcome banner inside a rich Panel."""
+    # MCP mode runs a separate auth session via mcp-remote (Node.js),
+    # so its "site" line is meaningless to us and the user needs a
+    # heads-up that a browser will open on first run.
+    if mode == "mcp":
+        site_line = "[yellow](managed by mcp-remote)[/yellow]"
+        extra_auth_note = (
+            "\n[yellow]⚠ MCP mode uses Atlassian's own auth — a browser "
+            "window will open on first run.[/yellow]\n"
+            "[dim]  (mcp-remote caches credentials under ~/.mcp-auth/ "
+            "independently from our OAuth token.)[/dim]\n"
+        )
+        node_note = (
+            "[dim]  Requires Node.js v18+ on PATH for the 'npx' / "
+            "'mcp-remote' subprocess.[/dim]\n"
+        )
+    else:
+        site_line = site_url or "(resolving…)"
+        extra_auth_note = ""
+        node_note = ""
+
     body = Text.from_markup(
         "[bold cyan]confluence-cli[/bold cyan]  —  "
         "ask anything about your Confluence space\n\n"
         f"[dim]mode   [/dim] [bold]{mode}[/bold]\n"
         "[dim]model  [/dim] claude-sonnet-4-6\n"
-        f"[dim]site   [/dim] {site_url or '(resolving…)'}\n"
-        f"[dim]space  [/dim] {space_key}\n\n"
+        f"[dim]site   [/dim] {site_line}\n"
+        f"[dim]space  [/dim] {space_key}\n"
+        f"{extra_auth_note}{node_note}\n"
         "[dim]Try asking:[/dim]\n"
         '  [cyan]•[/cyan] [italic]"What do we have in this workspace?"[/italic]\n'
         '  [cyan]•[/cyan] [italic]"What is the last incident we had?"[/italic]\n\n'
@@ -164,22 +185,31 @@ def _require_env(name: str) -> str:
 
 
 def build_agent(mode: str, space_key: str) -> _Agent:
-    """Construct the chosen agent, running OAuth if needed."""
-    anthropic_key = _require_env("ANTHROPIC_API_KEY")
-    client_id = _require_env("ATLASSIAN_CLIENT_ID")
-    client_secret = _require_env("ATLASSIAN_CLIENT_SECRET")
+    """Construct the chosen agent, running OAuth if needed.
 
-    oauth_client = OAuthClient(client_id=client_id, client_secret=client_secret)
+    REST mode needs our own Atlassian OAuth client id/secret — the agent
+    will open a browser on first run and cache a token under
+    ``~/.confluence-cli/token.json``. MCP mode does **not** use those
+    env vars at all because mcp-remote runs its own separate auth flow
+    as an ``npx`` subprocess.
+    """
+    anthropic_key = _require_env("ANTHROPIC_API_KEY")
 
     if mode == "rest":
+        client_id = _require_env("ATLASSIAN_CLIENT_ID")
+        client_secret = _require_env("ATLASSIAN_CLIENT_SECRET")
+        oauth_client = OAuthClient(
+            client_id=client_id, client_secret=client_secret
+        )
         return RestAgent(
             anthropic_api_key=anthropic_key,
             oauth_client=oauth_client,
             space_key=space_key,
         )
+
+    # MCP mode: mcp-remote (Node.js) handles Atlassian auth independently.
     return McpAgent(
         anthropic_api_key=anthropic_key,
-        oauth_client=oauth_client,
         space_key=space_key,
     )
 
@@ -264,7 +294,71 @@ def _run_question(agent: _Agent, question: str) -> None:
     console.print()
 
 
-def repl(agent: _Agent) -> int:
+def _render_error(exc: BaseException, mode: str) -> None:
+    """Print a context-aware error panel for a failed question.
+
+    Specialised rendering for the common transient-API failures we
+    already tried to retry before giving up, with mode-specific
+    guidance for the ones where mode matters (e.g. rate limits in MCP
+    mode are caused by the schema injection the comparison table warns
+    about — pointing the user at ``--mode rest`` is the actual fix).
+    """
+    exc_name = type(exc).__name__
+    exc_text = str(exc)
+    lowered = exc_text.lower()
+
+    # Rate limit (429) — especially painful in MCP mode.
+    status_code = getattr(exc, "status_code", None)
+    is_rate_limit = status_code == 429 or "rate_limit" in lowered or "rate limit" in lowered
+
+    if is_rate_limit:
+        console.print(
+            "\n[red]error:[/red] [bold]Anthropic rate limit hit[/bold]"
+        )
+        if mode == "mcp":
+            console.print(
+                "  [yellow]This is the failure mode the README comparison "
+                "table warns about under [bold]Token usage[/bold].[/yellow]\n"
+                "  The hosted Atlassian MCP server injects its full tool "
+                "schema (~24k input tokens) on [italic]every[/italic] "
+                "Claude call, which blows straight past the default\n"
+                "  10,000 input-tokens-per-minute budget on a single "
+                "question — no amount of retry will fix it within an "
+                "interactive session."
+            )
+            console.print(
+                "\n  [bold green]Fix:[/bold green] switch to REST mode, "
+                "which sends ~2k tokens of tool schemas instead of ~24k:"
+            )
+            console.print(
+                "    [cyan]python main.py --mode rest[/cyan]"
+            )
+            console.print(
+                "\n  [dim]Or wait ~60s for your token bucket to refill "
+                "and retry in MCP mode.[/dim]"
+            )
+        else:
+            console.print(
+                "  Your org has a 10,000 input-tokens-per-minute budget "
+                "on claude-sonnet-4-6 and you've burned through it.\n"
+                "  Wait ~60s for the bucket to refill and retry. If this "
+                "keeps happening on REST mode, contact Anthropic sales\n"
+                "  about a rate-limit increase."
+            )
+        return
+
+    if "overloaded" in lowered:
+        console.print(
+            "\n[red]error:[/red] Anthropic API is overloaded — we "
+            "retried 3 times with backoff and they're still shedding "
+            "load. Please try your question again in a moment."
+        )
+        return
+
+    console.print(f"\n[red]error:[/red] [bold]{exc_name}[/bold] {exc_text}")
+
+
+def repl(agent: _Agent, mode: str) -> int:
     """Read-eval-print loop. Returns a process exit code."""
     while True:
         try:
@@ -289,7 +383,7 @@ def repl(agent: _Agent) -> int:
             console.print("[yellow](interrupted)[/yellow]")
             continue
         except Exception as exc:  # noqa: BLE001
-            console.print(f"\n[red]error:[/red] {exc}")
+            _render_error(exc, mode)
             continue
 
 
@@ -312,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     site_url = getattr(getattr(agent, "_token", None), "site_url", "") or ""
     print_banner(args.mode, space_key, site_url)
 
-    return repl(agent)
+    return repl(agent, args.mode)
 
 
 if __name__ == "__main__":

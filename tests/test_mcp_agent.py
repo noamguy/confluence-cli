@@ -1,26 +1,27 @@
 """Tests for the MCP-mode agent.
 
-We patch both ``anthropic.Anthropic`` (to stub the streaming API) and the
-agent's own MCP helpers so no real network connection to
-``mcp.atlassian.com`` is ever attempted.
+We patch both ``anthropic.Anthropic`` (to stub the streaming API) and
+the agent's own MCP helpers so no real ``mcp-remote`` subprocess is
+ever spawned and no network connection to ``mcp.atlassian.com`` is
+ever attempted.
 """
 
 from __future__ import annotations
 
 import copy
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.mcp_agent import (
+    MCP_REMOTE_ARGS,
+    MCP_REMOTE_COMMAND,
     McpAgent,
     _format_exception,
     _is_transient_mcp_error,
     _mcp_tool_to_anthropic,
 )
-from agent.oauth import TokenBundle
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +79,13 @@ def _stream_driver(turns):
     return _stream, snapshots
 
 
-def _valid_token() -> TokenBundle:
-    return TokenBundle(
-        access_token="tok",
-        refresh_token="refresh",
-        expires_at=time.time() + 3600,
-        cloud_id="cid",
-        site_url="https://your-workspace.atlassian.net",
-    )
+def _build_agent() -> McpAgent:
+    """Construct an McpAgent with a mocked Anthropic client.
+
+    The MCP transport is stubbed out everywhere this helper is called,
+    so no ``mcp-remote`` subprocess is ever spawned.
+    """
+    return McpAgent(anthropic_api_key="k", space_key="PH")
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +164,6 @@ def test_is_transient_mcp_error_rejects_permanent_errors() -> None:
 
 
 def test_ask_returns_answer_without_tool_use() -> None:
-    oauth_client = MagicMock()
-
     final = _message(
         [_text_block("hello from mcp")],
         stop_reason="end_turn",
@@ -182,12 +180,7 @@ def test_ask_returns_answer_without_tool_use() -> None:
         "_ensure_tool_schemas",
         return_value=[{"name": "x", "description": "x", "input_schema": {"type": "object"}}],
     ):
-        agent = McpAgent(
-            anthropic_api_key="k",
-            oauth_client=oauth_client,
-            space_key="PH",
-            token_bundle=_valid_token(),
-        )
+        agent = _build_agent()
         emitted: list[str] = []
         response = agent.ask("hi", on_text=emitted.append)
 
@@ -198,8 +191,6 @@ def test_ask_returns_answer_without_tool_use() -> None:
 
 
 def test_ask_dispatches_mcp_tool_call() -> None:
-    oauth_client = MagicMock()
-
     first = _message(
         [_tool_use_block("tu_1", "atlassian_search", {"q": "runbook"})],
         stop_reason="tool_use",
@@ -230,12 +221,7 @@ def test_ask_dispatches_mcp_tool_call() -> None:
             {"name": "atlassian_search", "description": "s", "input_schema": {"type": "object"}}
         ],
     ), patch.object(McpAgent, "_call_mcp_tool", new=fake_call_mcp_tool):
-        agent = McpAgent(
-            anthropic_api_key="k",
-            oauth_client=oauth_client,
-            space_key="PH",
-            token_bundle=_valid_token(),
-        )
+        agent = _build_agent()
         response = agent.ask("find the runbook")
 
     assert response.answer == "done"
@@ -246,8 +232,6 @@ def test_ask_dispatches_mcp_tool_call() -> None:
 
 
 def test_ask_handles_mcp_tool_error() -> None:
-    oauth_client = MagicMock()
-
     first = _message(
         [_tool_use_block("tu_1", "atlassian_search", {"q": "x"})],
         stop_reason="tool_use",
@@ -274,15 +258,61 @@ def test_ask_handles_mcp_tool_error() -> None:
             {"name": "atlassian_search", "description": "s", "input_schema": {"type": "object"}}
         ],
     ), patch.object(McpAgent, "_call_mcp_tool", new=fake_call_mcp_tool):
-        agent = McpAgent(
-            anthropic_api_key="k",
-            oauth_client=oauth_client,
-            space_key="PH",
-            token_bundle=_valid_token(),
-        )
+        agent = _build_agent()
         response = agent.ask("anything")
 
     tool_result_msg = snapshots[1][-1]
     assert tool_result_msg["content"][0]["is_error"] is True
     assert "invalid_token" in tool_result_msg["content"][0]["content"]
     assert response.answer == "recovered"
+
+
+# ---------------------------------------------------------------------------
+# Transport plumbing — mcp-remote stdio subprocess
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_remote_command_is_npx_mcp_remote() -> None:
+    """The stdio subprocess must be 'npx -y mcp-remote <url>'.
+
+    Pinning this so a future refactor doesn't accidentally revert to
+    the broken direct-HTTP-with-bearer-token approach.
+    """
+    assert MCP_REMOTE_COMMAND == "npx"
+    assert MCP_REMOTE_ARGS[0] == "-y"
+    assert MCP_REMOTE_ARGS[1] == "mcp-remote"
+    assert MCP_REMOTE_ARGS[2].startswith("https://mcp.atlassian.com/")
+
+
+def test_stdio_params_uses_mcp_remote_command() -> None:
+    """McpAgent._stdio_params must target the mcp-remote proxy."""
+    agent = _build_agent()
+    params = agent._stdio_params()
+    assert params.command == "npx"
+    assert params.args == ["-y", "mcp-remote", agent.mcp_url]
+
+
+def test_stdio_params_honours_mcp_url_override() -> None:
+    """Overriding mcp_url propagates to the mcp-remote subprocess args."""
+    agent = McpAgent(
+        anthropic_api_key="k",
+        space_key="PH",
+        mcp_url="https://example.test/alt/mcp",
+    )
+    params = agent._stdio_params()
+    assert params.args[-1] == "https://example.test/alt/mcp"
+
+
+def test_mcp_agent_constructor_does_not_take_oauth_client() -> None:
+    """MCP mode must not require an OAuth client — mcp-remote handles auth.
+
+    This is a regression guard: the old API took an ``oauth_client``
+    positional argument and used it to build an Authorization header,
+    which Atlassian's MCP server silently rejected. The new API
+    deliberately has no OAuth dependency at all.
+    """
+    import inspect
+
+    sig = inspect.signature(McpAgent.__init__)
+    assert "oauth_client" not in sig.parameters
+    assert "token_bundle" not in sig.parameters

@@ -1,5 +1,18 @@
 # Confluence CLI — Design & Analysis
 
+## TL;DR
+
+The project ships two Confluence backends behind one CLI so they can be compared head-to-head on the same question: **REST** (direct Confluence REST API with our own OAuth token) and **MCP** (the official Atlassian MCP server). After running both in production for real queries, every empirical data point pointed in the same direction:
+
+- **MCP mode does not accept standard OAuth bearer tokens.** The hosted `mcp.atlassian.com` server rejects the Atlassian 3LO token we issue for REST mode. The only supported client is [`mcp-remote`](https://www.npmjs.com/package/mcp-remote), a Node.js package that runs as a local stdio proxy and manages its own separate browser auth under `~/.mcp-auth/`. This silently makes Node.js v18+ a runtime dependency and forces users through **two independent auth flows** with two different credential stores we cannot introspect or refresh from Python.
+- **MCP mode is mathematically unusable on the default Anthropic rate-limit tier.** The server injects ~24,000 input tokens of tool schemas on *every* Claude call. At the default 10,000 input-tokens-per-minute budget, a single interactive question is guaranteed to 429. REST mode sends ~2k tokens of schemas and stays well under the budget.
+- **MCP mode hides its own failures.** When the Atlassian backend is degraded it returns `CallToolResult` with `isError=true` and a human-readable error message as `content`, so Claude reads the error as data and paraphrases it back to the user as a polite apology — making root-cause analysis impossible without manual `isError` checking and `BaseExceptionGroup` unwrapping.
+- **REST mode worked first-try and has worked ever since.** The direct `/wiki/api/v2/pages/{id}` path plus a small custom tool surface gives us full control over scopes, token lifecycle, error surfaces, and token footprint. It's the correct choice for any production agent, and the project's comparison table is essentially a formal statement of that conclusion.
+
+MCP mode remains in the codebase as a working reference implementation so the comparison is grounded in real code, not just theory. If you're building on top of Atlassian's data, **use the REST path.**
+
+---
+
 ## Approach
 
 When implementing a new feature I start with the requirements, then investigate available solutions before writing a single line of code.
@@ -77,3 +90,25 @@ A typical question involves **3 Claude calls + 2 Confluence calls**, and without
 In MCP mode, errors surface as cryptic Claude responses rather than explicit error messages. This is a hallmark symptom of the MCP layer's instability — and the irony is that the error gets hidden by Claude rather than surfaced, which is the opposite of what you want when debugging a production agent.
 
 The REST approach fails loudly and explicitly with standard HTTP status codes, making issues immediately actionable.
+
+---
+
+### The MCP Server Does Not Accept Standard OAuth Bearer Tokens
+
+The most significant finding of this project. The first MCP-mode implementation connected directly to `https://mcp.atlassian.com/v1/mcp` over streamable HTTP and passed our Atlassian OAuth 2.0 (3LO) access token as an `Authorization: Bearer <token>` header — the natural pattern, and the one that works for every other Atlassian REST endpoint routed through `api.atlassian.com`.
+
+**It doesn't work for the MCP server.** Every tool call came back with either a TaskGroup exception wrapping an auth-layer failure, or a `CallToolResult` with `isError=true` and the payload `{"error":true,"message":"We are having trouble completing this action. Please try again shortly."}` — even on tools that don't touch Confluence content at all, like `atlassianUserInfo` and `getAccessibleAtlassianResources`. Expanding our OAuth scopes to match the exact consent screen Claude chat shows (including granular `read:page:confluence`, `write:comment:confluence`, `read:me`, `read:account`, etc.) did not help. The MCP server consistently refused tool calls regardless of the token's scope footprint.
+
+The supported path — not advertised anywhere in the MCP server's own docs and discovered only by tracing how `claude.ai` itself connects — is to use [`mcp-remote`](https://www.npmjs.com/package/mcp-remote): a Node.js package that runs locally as an `stdio` MCP proxy, opens its own browser window on first run, caches credentials under `~/.mcp-auth/`, and forwards JSON-RPC between our Python process and Atlassian's hosted server.
+
+**Consequences for anyone building on top of the official Atlassian MCP server:**
+
+1. **Node.js becomes a runtime dependency.** A Python agent that "uses Atlassian MCP" is silently also a Node.js deployment, because the only supported client is an `npm` package spawned via `npx`.
+
+2. **MCP mode and REST mode cannot share an OAuth token.** The REST path uses our own `agent/oauth.py` token at `~/.confluence-cli/token.json`; the MCP path uses whatever mcp-remote caches at `~/.mcp-auth/`. The user must authenticate **twice**, through two completely different browser flows, granting two overlapping-but-distinct scope sets. A CLI `--reset` flag can only reset the REST token; the mcp-remote credentials are opaque to us and require deleting a directory by hand.
+
+3. **The auth lifecycle is uncontrollable from Python.** We cannot inspect the mcp-remote token, refresh it on a schedule, rotate it when scopes change, or bundle fresh credentials into a test fixture. The agent has no visibility into whether auth is healthy until it fails.
+
+4. **The failure mode is dishonest by default.** Because the MCP server returns errors as `CallToolResult.content` text rather than surfacing them at the transport layer, Claude reads them as data and paraphrases them into polite apologies — silently hiding the real cause from the user. Our implementation mitigates this by checking `result.isError`, unwrapping `BaseExceptionGroup` from the `anyio` transport, and logging the raw error to stderr, but these are workarounds for a client/server contract that should never have surfaced errors this way in the first place.
+
+This is a fundamental architectural limitation of the official MCP server, not a bug we can fix in our client. It reinforces every conclusion in the comparison table above: the direct REST approach gives us a single OAuth flow we control end-to-end, no Node.js dependency, transparent HTTP-level errors, and auth state that lives in one place under our management. For any use case beyond a single developer pointing a supported IDE at the MCP server, REST is the correct choice.

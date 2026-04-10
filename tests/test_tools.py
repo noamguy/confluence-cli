@@ -75,6 +75,15 @@ def test_api_base_uses_cloud_id() -> None:
     assert client.api_base == "https://api.atlassian.com/ex/confluence/cloud-1/wiki/rest/api"
 
 
+def test_api_base_v2_uses_cloud_id() -> None:
+    """v2 base must exist and share the same cloud-id routing prefix."""
+    client = _client()
+    assert (
+        client.api_base_v2
+        == "https://api.atlassian.com/ex/confluence/cloud-1/wiki/api/v2"
+    )
+
+
 def test_search_builds_cql_and_parses_results() -> None:
     client = _client()
     payload = {
@@ -109,15 +118,34 @@ def test_search_clamps_limit_to_max() -> None:
     assert mget.call_args.kwargs["params"]["limit"] == 25
 
 
-def test_get_page_returns_plain_text_body() -> None:
+def test_get_page_hits_v2_endpoint_and_parses_body() -> None:
+    """get_page must route through the v2 surface, not the deprecated v1.
+
+    The v1 ``/content/{id}`` endpoint now returns HTTP 410 Gone for some
+    content, so we migrated to ``GET /wiki/api/v2/pages/{id}?body-format=storage``.
+    This test pins both the URL and the query string so an accidental
+    regression back to v1 trips CI loudly.
+    """
     client = _client()
     payload = {
         "id": "456",
         "title": "Runbook",
-        "body": {"storage": {"value": "<h1>Steps</h1><p>Do <em>this</em></p>"}},
+        "body": {
+            "storage": {
+                "representation": "storage",
+                "value": "<h1>Steps</h1><p>Do <em>this</em></p>",
+            }
+        },
     }
-    with patch("agent.tools.requests.get", return_value=_fake_get(payload)):
+    with patch("agent.tools.requests.get", return_value=_fake_get(payload)) as mget:
         page = client.get_page("456")
+
+    called_url = mget.call_args.args[0]
+    called_params = mget.call_args.kwargs["params"]
+    assert called_url.endswith("/wiki/api/v2/pages/456")
+    assert "/wiki/rest/api/" not in called_url  # regression guard
+    assert called_params == {"body-format": "storage"}
+
     assert page["id"] == "456"
     assert page["title"] == "Runbook"
     assert "Steps" in page["body_text"]

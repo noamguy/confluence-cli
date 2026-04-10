@@ -14,7 +14,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.oauth import DEFAULT_TOKEN_PATH, OAuthClient, TokenBundle, resolve_token_path
+from agent.oauth import (
+    DEFAULT_TOKEN_PATH,
+    OAuthClient,
+    TokenBundle,
+    _run_loopback_server,
+    resolve_token_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +114,37 @@ def test_resolve_token_path_falls_back_to_default(
 ) -> None:
     monkeypatch.delenv("CONFLUENCE_CLI_TOKEN_PATH", raising=False)
     assert resolve_token_path() == DEFAULT_TOKEN_PATH.expanduser()
+
+
+# ---------------------------------------------------------------------------
+# Loopback server port-collision handling
+# ---------------------------------------------------------------------------
+
+
+def test_run_loopback_server_wraps_addr_in_use_as_runtime_error() -> None:
+    """Port-collision should become a helpful RuntimeError, not a raw OSError.
+
+    We simulate the bind failure by patching ``_ReusableTCPServer`` to raise
+    ``OSError(48, "Address already in use")`` — the exact shape macOS
+    produces — and verify that :func:`_run_loopback_server` re-raises it
+    as a ``RuntimeError`` mentioning ``lsof`` so the user can diagnose.
+    """
+    with patch(
+        "agent.oauth._ReusableTCPServer",
+        side_effect=OSError(48, "Address already in use"),
+    ):
+        with pytest.raises(RuntimeError, match="lsof -i :8765"):
+            _run_loopback_server()
+
+
+def test_run_loopback_server_re_raises_unrelated_os_errors() -> None:
+    """Non-port-collision OSErrors should not be wrapped."""
+    with patch(
+        "agent.oauth._ReusableTCPServer",
+        side_effect=OSError(13, "Permission denied"),
+    ):
+        with pytest.raises(OSError, match="Permission denied"):
+            _run_loopback_server()
 
 
 # ---------------------------------------------------------------------------
