@@ -1,8 +1,9 @@
-"""Shared Atlassian OAuth 2.0 (3LO) flow for confluence-cli.
+"""Atlassian OAuth 2.0 (3LO) flow for confluence-cli (REST mode only).
 
-Both the MCP-backed agent and the direct-REST agent authenticate against
-Atlassian using the exact same OAuth token, so the browser dance and
-token-cache logic live here in one place.
+This module handles browser-based OAuth for the **REST-mode** agent.
+MCP mode does *not* use this flow — ``mcp-remote`` runs its own
+independent browser-based auth and caches credentials under
+``~/.mcp-auth/``.
 
 First-run:  opens a browser, catches the redirect on a local loopback
             server, exchanges the authorization code for an access token,

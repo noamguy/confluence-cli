@@ -30,7 +30,8 @@ from rich.text import Text
 
 from agent.mcp_agent import McpAgent
 from agent.oauth import OAuthClient, resolve_token_path
-from agent.rest_agent import AgentResponse, RestAgent
+from agent._claude_loop import AgentResponse
+from agent.rest_agent import RestAgent
 
 #: Shared rich console — used for the banner, REPL prompt, live region,
 #: tool markers, and footer lines.
@@ -52,6 +53,8 @@ class _Agent(Protocol):
         on_tool_call: Optional[Callable[[str], None]] = None,
         on_turn_start: Optional[Callable[[], None]] = None,
     ) -> AgentResponse: ...
+
+    def get_site_url(self) -> str: ...
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     space_key = args.space or os.environ.get("CONFLUENCE_SPACE_KEY", "PH")
     agent = build_agent(args.mode, space_key)
 
-    # Best-effort: show site URL in the banner if the agent has a token bundle.
-    site_url = getattr(getattr(agent, "_token", None), "site_url", "") or ""
+    site_url = agent.get_site_url()
     print_banner(args.mode, space_key, site_url)
 
     return repl(agent, args.mode)

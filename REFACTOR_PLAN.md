@@ -7,8 +7,8 @@ below is a *pure refactor* — no behaviour changes, just consolidation and
 boundary cleanup. The existing 77-test suite is strong enough to catch
 regressions.
 
-**Status:** pending. The repo is in a fully working, tested, committed
-state at `8d3ce90`. Pick this up in a fresh session.
+**Status:** completed. All steps executed successfully — 77 tests pass,
+both agents delegate to `run_tool_use_loop()`, no cross-imports remain.
 
 ---
 

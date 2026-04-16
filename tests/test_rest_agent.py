@@ -12,90 +12,23 @@ agent:
 
 from __future__ import annotations
 
-import copy
 import time
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.oauth import TokenBundle
-from agent.rest_agent import (
+from agent._claude_loop import (
     _DEFAULT_RATE_LIMIT_DELAY,
     _MAX_RETRY_AFTER_SECONDS,
-    RestAgent,
     _compute_anthropic_backoff,
     _extract_retry_after,
     _format_tool_call,
     _is_retryable_anthropic_error,
 )
+from agent.oauth import TokenBundle
+from agent.rest_agent import RestAgent
 
-
-# ---------------------------------------------------------------------------
-# Stub message / content / stream helpers
-# ---------------------------------------------------------------------------
-
-
-def _text_block(text: str) -> SimpleNamespace:
-    return SimpleNamespace(type="text", text=text)
-
-
-def _tool_use_block(block_id: str, name: str, input_: dict) -> SimpleNamespace:
-    return SimpleNamespace(type="tool_use", id=block_id, name=name, input=input_)
-
-
-def _message(content, stop_reason: str, input_tokens=10, output_tokens=5) -> SimpleNamespace:
-    """Build a final-message stub as returned by ``stream.get_final_message()``."""
-    return SimpleNamespace(
-        content=content,
-        stop_reason=stop_reason,
-        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
-    )
-
-
-class _FakeStream:
-    """Context-manager stub mimicking ``anthropic.Messages.stream``.
-
-    Yields a fixed list of text chunks from ``text_stream`` and returns a
-    pre-built final message from ``get_final_message``. Good enough to
-    drive both tool-use turns (no text chunks) and final-answer turns
-    (text chunks) through the agent's streaming loop.
-    """
-
-    def __init__(self, final_message: SimpleNamespace, text_chunks=()) -> None:
-        self._final = final_message
-        self._chunks = list(text_chunks)
-
-    def __enter__(self) -> "_FakeStream":
-        return self
-
-    def __exit__(self, *exc) -> bool:  # noqa: D401 - context manager protocol
-        return False
-
-    @property
-    def text_stream(self):
-        return iter(self._chunks)
-
-    def get_final_message(self) -> SimpleNamespace:
-        return self._final
-
-
-def _stream_driver(turns):
-    """Return a function suitable for ``fake.messages.stream.side_effect``.
-
-    ``turns`` is a list of ``(final_message, text_chunks)`` pairs. Each
-    call to ``stream`` yields the next pair and also records a deep copy
-    of the messages argument into ``snapshots`` for post-hoc assertions.
-    """
-    snapshots: list[list] = []
-    turns_iter = iter(turns)
-
-    def _stream(**kwargs):
-        snapshots.append(copy.deepcopy(kwargs["messages"]))
-        final_message, chunks = next(turns_iter)
-        return _FakeStream(final_message, chunks)
-
-    return _stream, snapshots
+from tests.conftest import _FakeStream, _message, _stream_driver, _text_block, _tool_use_block
 
 
 def _valid_token() -> TokenBundle:
@@ -257,7 +190,7 @@ def test_ask_fails_fast_on_tpm_rate_limit_with_long_retry_after() -> None:
     fake_anthropic.messages.stream.side_effect = TPMRateLimit()
 
     with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
-        "agent.rest_agent.time.sleep"
+        "agent._claude_loop.time.sleep"
     ) as sleep_mock:
         agent = RestAgent(
             anthropic_api_key="k",
@@ -297,7 +230,7 @@ def test_ask_retries_short_rate_limit_with_server_delay() -> None:
     fake_anthropic.messages.stream.side_effect = _stream
 
     with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
-        "agent.rest_agent.time.sleep"
+        "agent._claude_loop.time.sleep"
     ) as sleep_mock:
         agent = RestAgent(
             anthropic_api_key="k",
@@ -502,7 +435,7 @@ def test_ask_retries_on_anthropic_overloaded_error() -> None:
     fake_anthropic.messages.stream.side_effect = _stream
 
     with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
-        "agent.rest_agent.time.sleep"
+        "agent._claude_loop.time.sleep"
     ) as sleep_mock:
         agent = RestAgent(
             anthropic_api_key="k",
@@ -531,7 +464,7 @@ def test_ask_gives_up_after_max_attempts_on_overloaded() -> None:
     fake_anthropic.messages.stream.side_effect = _stream
 
     with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
-        "agent.rest_agent.time.sleep"
+        "agent._claude_loop.time.sleep"
     ):
         agent = RestAgent(
             anthropic_api_key="k",
@@ -557,7 +490,7 @@ def test_ask_does_not_retry_auth_errors() -> None:
     fake_anthropic.messages.stream.side_effect = AuthError("bad key")
 
     with patch("agent.rest_agent.anthropic.Anthropic", return_value=fake_anthropic), patch(
-        "agent.rest_agent.time.sleep"
+        "agent._claude_loop.time.sleep"
     ) as sleep_mock:
         agent = RestAgent(
             anthropic_api_key="k",

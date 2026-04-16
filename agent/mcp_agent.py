@@ -28,27 +28,18 @@ Why mcp-remote instead of direct HTTP:
 .. _mcp-remote: https://www.npmjs.com/package/mcp-remote
 
 The rest of this module (streaming tool-use loop, retry logic, token
-usage accounting) is identical to :class:`RestAgent` — only the
-transport layer changed.
+usage accounting) delegates to :func:`agent._claude_loop.run_tool_use_loop`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
-import time
 from typing import Any, Callable, Optional
 
 import anthropic
 
-from .rest_agent import (
-    ANTHROPIC_MAX_ATTEMPTS,
-    AgentResponse,
-    _compute_anthropic_backoff,
-    _format_tool_call,
-    _is_retryable_anthropic_error,
-    _stringify_tool_result,
-)
+from ._claude_loop import AgentResponse, _format_tool_call, _stringify_tool_result, run_tool_use_loop
 
 #: Atlassian hosted MCP endpoint. Passed as an argument to ``mcp-remote``,
 #: which connects to it over streamable HTTP on our behalf.
@@ -116,9 +107,6 @@ def _format_exception(exc: BaseException, depth: int = 0) -> str:
 
 #: Same model as the REST agent, per project spec.
 MODEL = "claude-sonnet-4-6"
-
-#: Hard cap on tool-use iterations per question.
-MAX_ITERATIONS = 8
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant that answers questions about a Confluence "
@@ -284,153 +272,54 @@ class McpAgent:
     ) -> AgentResponse:
         """Answer a single question via Claude + Atlassian MCP tools.
 
-        Structurally identical to :meth:`RestAgent.ask` (streaming plus
-        ``on_text`` / ``on_tool_call`` / ``on_turn_start`` callbacks), but
-        every tool call is dispatched to the MCP server instead of our
-        local REST client.
+        Delegates to :func:`agent._claude_loop.run_tool_use_loop` with
+        MCP-specific tool execution and error formatting.
         """
         tool_schemas = self._ensure_tool_schemas()
 
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "user",
-                "content": (
-                    f"(Confluence space key: {self.space_key})\n\n{question}"
-                ),
-            }
-        ]
-        tool_calls_log: list[str] = []
-        input_total = 0
-        output_total = 0
-        streamed_answer: list[str] = []
+        def _execute_tool(name: str, args: dict) -> Any:
+            return asyncio.run(self._call_mcp_tool(name, args))
 
-        for _ in range(MAX_ITERATIONS):
-            if on_turn_start is not None:
-                on_turn_start()
+        def _format_tool_error(exc: Exception) -> str:
+            # Print the real error to stderr so the user sees the
+            # actual cause — otherwise Claude paraphrases it into
+            # a generic apology and the root cause is invisible.
+            # stderr sits outside rich.Live's managed stdout, so
+            # this won't corrupt the live markdown view. anyio's
+            # TaskGroup raises ``ExceptionGroup`` (an ``Exception``
+            # subclass) whose ``str()`` hides the real sub-error;
+            # ``_format_exception`` walks the tree so we see it.
+            detail = _format_exception(exc)
+            print(
+                f"\n\u26a0  MCP tool failed:\n{detail}\n",
+                file=sys.stderr,
+                flush=True,
+            )
+            return f"MCP tool error:\n{detail}"
 
-            # Retry loop for transient Anthropic API errors (overloaded,
-            # rate-limited, 5xx). Only retries when no text has streamed
-            # yet — see RestAgent.ask for the reasoning.
-            final_message = None
-            for attempt in range(ANTHROPIC_MAX_ATTEMPTS):
-                attempt_streamed_any = False
-                try:
-                    with self.anthropic.messages.stream(
-                        model=self.model,
-                        max_tokens=2048,
-                        system=SYSTEM_PROMPT,
-                        tools=tool_schemas,
-                        messages=messages,
-                    ) as stream:
-                        for text in stream.text_stream:
-                            attempt_streamed_any = True
-                            streamed_answer.append(text)
-                            if on_text is not None:
-                                on_text(text)
-                        final_message = stream.get_final_message()
-                    break  # success — exit retry loop
-                except Exception as exc:  # noqa: BLE001
-                    is_last = attempt == ANTHROPIC_MAX_ATTEMPTS - 1
-                    if (
-                        attempt_streamed_any
-                        or is_last
-                        or not _is_retryable_anthropic_error(exc)
-                    ):
-                        raise
-                    delay = _compute_anthropic_backoff(exc, attempt)
-                    if delay is None:
-                        # Server asked us to wait longer than we'll block
-                        # the REPL for (typically a TPM budget exhaustion
-                        # — exactly the failure mode MCP mode provokes
-                        # because of its 24k-token-per-query schema cost).
-                        raise
-                    print(
-                        f"  \u21bb Anthropic API returned a transient error "
-                        f"({type(exc).__name__}); retrying in {delay:.0f}s "
-                        f"(attempt {attempt + 2}/{ANTHROPIC_MAX_ATTEMPTS})…",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    time.sleep(delay)
-
-            assert final_message is not None
-
-            input_total += getattr(final_message.usage, "input_tokens", 0) or 0
-            output_total += getattr(final_message.usage, "output_tokens", 0) or 0
-            messages.append({"role": "assistant", "content": final_message.content})
-
-            if final_message.stop_reason != "tool_use":
-                answer = "".join(streamed_answer).strip()
-                if not answer:
-                    answer = "".join(
-                        block.text
-                        for block in final_message.content
-                        if getattr(block, "type", "") == "text"
-                    ).strip()
-                return AgentResponse(
-                    answer=answer,
-                    tool_calls=tool_calls_log,
-                    usage={
-                        "input": input_total,
-                        "output": output_total,
-                        "total": input_total + output_total,
-                    },
-                )
-
-            tool_results: list[dict[str, Any]] = []
-            for block in final_message.content:
-                if getattr(block, "type", "") != "tool_use":
-                    continue
-                name = block.name
-                arguments = block.input or {}
-                call_str = _format_tool_call(name, arguments)
-                tool_calls_log.append(call_str)
-                if on_tool_call is not None:
-                    on_tool_call(call_str)
-                try:
-                    result = asyncio.run(self._call_mcp_tool(name, arguments))
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": _stringify_tool_result(result),
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001 - surface errors to Claude
-                    # Print the real error to stderr so the user sees the
-                    # actual cause — otherwise Claude paraphrases it into
-                    # a generic apology and the root cause is invisible.
-                    # stderr sits outside rich.Live's managed stdout, so
-                    # this won't corrupt the live markdown view. anyio's
-                    # TaskGroup raises ``ExceptionGroup`` (an ``Exception``
-                    # subclass) whose ``str()`` hides the real sub-error;
-                    # ``_format_exception`` walks the tree so we see it.
-                    detail = _format_exception(exc)
-                    print(
-                        f"\n\u26a0  MCP tool {name!r} failed:\n{detail}\n",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "is_error": True,
-                            "content": f"MCP tool error:\n{detail}",
-                        }
-                    )
-
-            messages.append({"role": "user", "content": tool_results})
-
-        return AgentResponse(
-            answer="(Stopped: exceeded max tool-use iterations before a final answer.)",
-            tool_calls=tool_calls_log,
-            usage={
-                "input": input_total,
-                "output": output_total,
-                "total": input_total + output_total,
-            },
+        return run_tool_use_loop(
+            anthropic_client=self.anthropic,
+            model=self.model,
+            system_prompt=SYSTEM_PROMPT,
+            tool_schemas=tool_schemas,
+            initial_messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"(Confluence space key: {self.space_key})\n\n{question}"
+                    ),
+                }
+            ],
+            execute_tool=_execute_tool,
+            format_tool_error=_format_tool_error,
+            on_text=on_text,
+            on_tool_call=on_tool_call,
+            on_turn_start=on_turn_start,
         )
+
+    def get_site_url(self) -> str:
+        """Return the site URL (MCP mode has no local token)."""
+        return "(managed by mcp-remote)"
 
 
 # ---------------------------------------------------------------------------

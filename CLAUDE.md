@@ -37,13 +37,14 @@ main.py                         ← rich-powered REPL + argparse + banner
   │
   │ constructs one of ↓ based on --mode
   │
+  ├── agent/_claude_loop.py     ← shared streaming tool-use loop, retry logic, AgentResponse
   ├── agent/rest_agent.py       ← Claude + local tools from agent/tools.py
   └── agent/mcp_agent.py        ← Claude + remote tools from mcp.atlassian.com/v1/mcp
          │
-         └── both import agent/oauth.py for the shared TokenBundle
+         └── REST mode imports agent/oauth.py; MCP mode uses mcp-remote's independent auth
 ```
 
-Both agents expose **exactly** the same public method:
+Both agents expose **exactly** the same public interface:
 
 ```python
 agent.ask(
@@ -52,20 +53,22 @@ agent.ask(
     on_tool_call: Optional[Callable[[str], None]] = None,  # formatted tool call
     on_turn_start: Optional[Callable[[], None]] = None,    # before each Claude roundtrip
 ) -> AgentResponse
+
+agent.get_site_url() -> str
 ```
 
 `main.py` drives the rich UI purely through these callbacks — the agents are presentation-agnostic. When adding a new agent feature, ensure any new callback or behaviour lands in **both** `rest_agent.py` and `mcp_agent.py` so the two modes stay interchangeable from `main.py`'s perspective.
 
-`AgentResponse` and the shared helpers `_format_tool_call` / `_stringify_tool_result` live in `rest_agent.py` and are imported by `mcp_agent.py` — this is the one intentional coupling between the two files.
+`AgentResponse`, `_format_tool_call`, `_stringify_tool_result`, and all Anthropic retry helpers live in `agent/_claude_loop.py`. Both agents delegate their `ask()` method to `run_tool_use_loop()` from that module, passing in agent-specific callbacks for tool execution and error formatting. Neither agent imports from the other.
 
-### Tool-use loop (both agents)
+### Tool-use loop (`agent/_claude_loop.py`)
 
-Both `ask()` implementations run the same streaming Claude loop (`MAX_ITERATIONS = 8` per question, `max_tokens = 2048`):
+`run_tool_use_loop()` encapsulates the streaming Claude loop (`MAX_ITERATIONS = 8` per question, `max_tokens = 2048`):
 
 1. Fire `on_turn_start()`.
 2. Open `client.messages.stream(...)` with `tools=<schemas>` and `messages=<history>`.
 3. Forward each text chunk to `on_text`.
-4. If `stop_reason != "tool_use"`, return; otherwise execute every `tool_use` block, call `on_tool_call(call_str)` for each, append `tool_result` blocks (with `is_error=True` on exceptions) as a single user message, and loop.
+4. If `stop_reason != "tool_use"`, return; otherwise execute every `tool_use` block via the `execute_tool` callback, call `on_tool_call(call_str)` for each, append `tool_result` blocks (with `is_error=True` on exceptions formatted via the `format_tool_error` callback) as a single user message, and loop.
 5. Tool results are serialized back to Claude via `_stringify_tool_result` (JSON for anything serializable, `str()` fallback).
 
 **Do not** inject status markers via `on_text` — that's what `on_tool_call` is for. Mixing the two was the previous design and caused presentation leaks into the agent.
@@ -100,15 +103,17 @@ The cloud id is resolved via `/oauth/token/accessible-resources` and matched aga
 
 ### Token expiry and skew
 
-`TokenBundle.is_expired(skew=60)` treats a token as expired **60 seconds before** the real expiry. Both `RestAgent._ensure_fresh_token` and `McpAgent._ensure_fresh_token` call this at the top of every `ask()`. Don't add "optimizations" that skip this check — the skew is specifically there to avoid 401s mid-conversation.
+`TokenBundle.is_expired(skew=60)` treats a token as expired **60 seconds before** the real expiry. `RestAgent._ensure_fresh_token` calls this at the top of every `ask()`. (MCP mode does not manage tokens — mcp-remote handles its own auth.) Don't add "optimizations" that skip this check — the skew is specifically there to avoid 401s mid-conversation.
 
 ### Tool-call formatting quirk
 
-`_format_tool_call(name, arguments)` in `rest_agent.py` intentionally renders numeric-looking string ids **without quotes** (`get_page(id=589825)`) to match the exact output format specified in the original project requirements. Real Confluence ids come from Claude as JSON strings, so the "isdigit" check in `_render` is load-bearing — removing it breaks `test_format_tool_call_multi_arg_uses_kwargs`.
+`_format_tool_call(name, arguments)` in `_claude_loop.py` intentionally renders numeric-looking string ids **without quotes** (`get_page(id=589825)`) to match the exact output format specified in the original project requirements. Real Confluence ids come from Claude as JSON strings, so the "isdigit" check in `_render` is load-bearing — removing it breaks `test_format_tool_call_multi_arg_uses_kwargs`.
 
 ### Testing patterns worth knowing
 
-- **Messages-list deep-copy trap**: `fake_anthropic.messages.stream.side_effect` receives the `messages` list by reference. The agent continues mutating that list after the call, so `call_args_list[N].kwargs["messages"]` reflects the *final* state, not the state at call time. Both `test_rest_agent.py` and `test_mcp_agent.py` work around this with a `_stream_driver` helper that `copy.deepcopy`s the messages into per-call snapshots. Reuse this pattern for any new test that asserts on historical message state.
+- **Shared test helpers in `tests/conftest.py`**: `_text_block`, `_tool_use_block`, `_message`, `_FakeStream`, and `_stream_driver` live in `tests/conftest.py` and are imported by both test files.
+
+- **Messages-list deep-copy trap**: `fake_anthropic.messages.stream.side_effect` receives the `messages` list by reference. The agent continues mutating that list after the call, so `call_args_list[N].kwargs["messages"]` reflects the *final* state, not the state at call time. The `_stream_driver` helper in conftest `copy.deepcopy`s the messages into per-call snapshots. Reuse this pattern for any new test that asserts on historical message state.
 
 - **Fake streaming**: the `_FakeStream` helper mimics `anthropic.Messages.stream`'s context manager. It yields a fixed list of text chunks from `text_stream` and returns a pre-built final-message `SimpleNamespace` from `get_final_message()`. Good enough for both tool-use turns (empty chunks) and final-answer turns (text chunks).
 

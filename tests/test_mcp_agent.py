@@ -8,7 +8,6 @@ ever attempted.
 
 from __future__ import annotations
 
-import copy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -23,60 +22,7 @@ from agent.mcp_agent import (
     _mcp_tool_to_anthropic,
 )
 
-
-# ---------------------------------------------------------------------------
-# Stub helpers (mirrors the REST-agent test helpers)
-# ---------------------------------------------------------------------------
-
-
-def _text_block(text: str) -> SimpleNamespace:
-    return SimpleNamespace(type="text", text=text)
-
-
-def _tool_use_block(block_id: str, name: str, input_: dict) -> SimpleNamespace:
-    return SimpleNamespace(type="tool_use", id=block_id, name=name, input=input_)
-
-
-def _message(content, stop_reason: str, input_tokens=10, output_tokens=5) -> SimpleNamespace:
-    return SimpleNamespace(
-        content=content,
-        stop_reason=stop_reason,
-        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
-    )
-
-
-class _FakeStream:
-    """Context manager mimicking ``anthropic.Messages.stream``."""
-
-    def __init__(self, final_message: SimpleNamespace, text_chunks=()) -> None:
-        self._final = final_message
-        self._chunks = list(text_chunks)
-
-    def __enter__(self) -> "_FakeStream":
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        return False
-
-    @property
-    def text_stream(self):
-        return iter(self._chunks)
-
-    def get_final_message(self) -> SimpleNamespace:
-        return self._final
-
-
-def _stream_driver(turns):
-    """Build a ``messages.stream`` side_effect that replays fixed turns."""
-    snapshots: list[list] = []
-    turns_iter = iter(turns)
-
-    def _stream(**kwargs):
-        snapshots.append(copy.deepcopy(kwargs["messages"]))
-        final_message, chunks = next(turns_iter)
-        return _FakeStream(final_message, chunks)
-
-    return _stream, snapshots
+from tests.conftest import _message, _stream_driver, _text_block, _tool_use_block
 
 
 def _build_agent() -> McpAgent:
